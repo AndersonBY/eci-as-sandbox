@@ -1,5 +1,4 @@
 import os
-import time
 from pathlib import Path
 
 from eci_as_sandbox import EciSandbox
@@ -21,14 +20,6 @@ def main(sandbox_id: str) -> None:
     print("Error:", result.error_message)
     print("Output:")
     print(result.output.strip())
-
-    time.sleep(4)
-    follow_up = client.exec_command(
-        sandbox_id,
-        ["/bin/sh", "-c", "tail -n 20 /tmp/eci_sandbox_exec_*.log 2>/dev/null || true"],
-    )
-    print("Follow-up output:")
-    print(follow_up.output.strip())
 
 
 if __name__ == "__main__":

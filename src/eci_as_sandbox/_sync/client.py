@@ -5,6 +5,7 @@ import os
 import random
 import shlex
 import string
+import time
 from typing import Any, Dict, Optional
 
 from alibabacloud_eci20180808 import models as eci_models
@@ -30,10 +31,12 @@ from .._common.models import (
     SandboxResult,
     extract_request_id,
 )
+from .._common.ws import decode_ws_message
 from .sandbox import Sandbox
 
 
 _logger = get_logger("eci-as-sandbox")
+_DEFAULT_SYNC_TIMEOUT = 600.0
 
 
 class EciSandbox:
@@ -488,21 +491,51 @@ class EciSandbox:
                 error_message="container_name is required",
             )
 
-        log_path = None
-        if sync and timeout is not None:
-            log_path = (
-                f"/tmp/eci_sandbox_exec_{int(random.random() * 1_000_000_000)}.log"
-            )
-            command = self._wrap_command_for_log(command, log_path)
-
-        command_json = json.dumps(command, ensure_ascii=False)
-
         _log_api_call(
             "ExecContainerCommand",
             f"ContainerGroupId={sandbox_id}, Container={container_name}",
         )
 
         try:
+            command_json = json.dumps(command, ensure_ascii=False)
+            if sync:
+                response = self._exec_container_command(
+                    sandbox_id=sandbox_id,
+                    container_name=container_name,
+                    command_json=command_json,
+                    sync=False,
+                    timeout=None,
+                )
+                request_id = extract_request_id(response)
+                body = response.to_map().get("body", {})
+                http_url = body.get("HttpUrl", "")
+                websocket_url = body.get("WebSocketUri", "")
+                output = ""
+                if not websocket_url:
+                    return CommandResult(
+                        request_id=request_id,
+                        success=False,
+                        error_message="WebSocketUri not returned for sync exec.",
+                        http_url=http_url,
+                        websocket_url=websocket_url,
+                    )
+                output = self._read_ws_output(
+                    websocket_url, self._normalize_sync_timeout(timeout)
+                )
+                _log_api_response(
+                    "ExecContainerCommand",
+                    request_id,
+                    True,
+                    {"sandbox_id": sandbox_id, "container": container_name},
+                )
+                return CommandResult(
+                    request_id=request_id,
+                    success=True,
+                    output=output,
+                    http_url=http_url,
+                    websocket_url=websocket_url,
+                )
+
             response = self._exec_container_command(
                 sandbox_id=sandbox_id,
                 container_name=container_name,
@@ -513,11 +546,6 @@ class EciSandbox:
             request_id = extract_request_id(response)
             body = response.to_map().get("body", {})
             output = body.get("SyncResponse", "") if sync else ""
-            if log_path:
-                output = (
-                    self._read_log_output(sandbox_id, container_name, log_path)
-                    or output
-                )
             http_url = body.get("HttpUrl", "")
             websocket_url = body.get("WebSocketUri", "")
             _log_api_response(
@@ -534,14 +562,11 @@ class EciSandbox:
                 websocket_url=websocket_url,
             )
         except Exception as exc:
-            output = ""
-            if log_path:
-                output = self._read_log_output(sandbox_id, container_name, log_path)
             _log_operation_error("ExecContainerCommand", str(exc), exc_info=True)
             return CommandResult(
                 request_id="",
                 success=False,
-                output=output,
+                output="",
                 error_message=f"Failed to exec command: {exc}",
             )
 
@@ -603,6 +628,44 @@ class EciSandbox:
             connect_timeout=timeout_ms,
         )
         return self.client.exec_container_command_with_options(request, runtime)
+
+    def _normalize_sync_timeout(self, timeout: Optional[float]) -> float:
+        if timeout is None:
+            return _DEFAULT_SYNC_TIMEOUT
+        if timeout <= 0:
+            return _DEFAULT_SYNC_TIMEOUT
+        return min(timeout, _DEFAULT_SYNC_TIMEOUT)
+
+    def _read_ws_output(self, websocket_url: str, timeout: float) -> str:
+        try:
+            import websocket
+        except Exception as exc:  # pragma: no cover - dependency guard
+            raise RuntimeError(
+                "websocket-client is required for sync exec output streaming."
+            ) from exc
+
+        output_chunks: list[str] = []
+        end_time = time.monotonic() + timeout
+        ws = websocket.create_connection(websocket_url, timeout=1)
+        try:
+            while time.monotonic() < end_time:
+                remaining = end_time - time.monotonic()
+                ws.settimeout(min(1.0, remaining))
+                try:
+                    message = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except websocket.WebSocketConnectionClosedException:
+                    break
+                if message is None:
+                    break
+                output_chunks.append(decode_ws_message(message))
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        return "".join(output_chunks)
 
     def _wrap_command_for_log(self, command: list[str], log_path: str) -> list[str]:
         if len(command) >= 2 and command[0] in {"/bin/sh", "sh"} and command[1] == "-c":

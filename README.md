@@ -84,7 +84,7 @@ asyncio.run(main())
 
 ## Command helpers
 
-`exec_command` runs a list-form command. `timeout` is in seconds and controls the API read timeout. When `sync=True` and `timeout` is set, the command is wrapped to capture output into `/tmp`, so a timeout still returns the captured output (tailing up to 200 lines).
+`exec_command` runs a list-form command. With `sync=True` (default) it uses the ECI WebSocket stream to collect output. `timeout` is in seconds and caps the stream duration (default 600 seconds, max 600). Use `sync=False` if you want the WebSocket/HTTP URLs without waiting.
 
 ```python
 result = sandbox.exec_command(

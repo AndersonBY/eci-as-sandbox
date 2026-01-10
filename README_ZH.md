@@ -84,7 +84,7 @@ asyncio.run(main())
 
 ## 命令助手
 
-`exec_command` 使用 list 形式执行命令。`timeout` 单位为秒，用于控制 API 的读取超时。当 `sync=True` 且设置了 `timeout` 时，会将输出写入 `/tmp`，即便超时也会返回已捕获的输出（最多回传 200 行）。
+`exec_command` 使用 list 形式执行命令。默认 `sync=True` 会通过 ECI 的 WebSocket 流读取输出。`timeout` 单位为秒，用于限制读取时长（默认 600 秒，最大 600）。如果你只需要 WebSocket/HTTP URL，请设置 `sync=False`。
 
 ```python
 result = sandbox.exec_command(
