@@ -1,6 +1,6 @@
 [project]
 name = "eci-as-sandbox"
-version = "0.1.0"
+version = "0.1.1"
 description = "ECI-backed sandbox manager with an Agent interface."
 requires-python = ">=3.9"
 readme = "README.md"
@@ -9,6 +9,11 @@ dependencies = [
     "alibabacloud-eci20180808>=2.0.8",
     "python-dotenv>=1.0.0"
 ]
+
+[project.urls]
+Homepage = "https://github.com/AndersonBY/eci-as-sandbox"
+Repository = "https://github.com/AndersonBY/eci-as-sandbox"
+Issues = "https://github.com/AndersonBY/eci-as-sandbox/issues"
 
 [build-system]
 requires = ["pdm-backend>=2.0.0"]
