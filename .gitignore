@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# PDM
+.pdm-python
+.pdm.toml
+
+# Builds
+build/
+dist/
+
+# Tooling caches
+.ruff_cache/
+.pyright/
+.mypy_cache/
+.pytest_cache/
+
+# Environment files
+.env
+.env.*
