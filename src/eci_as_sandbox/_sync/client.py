@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import random
@@ -583,9 +584,13 @@ class EciSandbox:
             return CommandResult(success=False, error_message="command is required")
         if exec_dir:
             command = f"cd {shlex.quote(exec_dir)} && {command}"
+        # Encode command as base64 to preserve heredoc, special characters, etc.
+        # The command is decoded and piped to bash in the container
+        encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
+        wrapper = f"echo {encoded} | base64 -d | bash"
         return self.exec_command(
             sandbox_id=sandbox_id,
-            command=["bash", "-lc", command],
+            command=["bash", "-lc", wrapper],
             container_name=container_name,
             sync=sync,
             timeout=timeout,
