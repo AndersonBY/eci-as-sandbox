@@ -181,16 +181,22 @@ class EciSandbox:
                 )
             )
 
-        container = eci_models.CreateContainerGroupRequestContainer(
-            name=container_name,
-            image=image,
-            cpu=cpu,
-            memory=memory,
-            command=command or [],
-            arg=args or [],
-            environment_var=env_vars,
-            port=port_configs,
-        )
+        # 注意：ECI API 中如果传递空列表 [] 给 command，会覆盖容器的 ENTRYPOINT
+        # 只有当 command/args 有实际内容时才传递，否则让容器使用镜像默认的 ENTRYPOINT/CMD
+        container_kwargs: Dict[str, Any] = {
+            "name": container_name,
+            "image": image,
+            "cpu": cpu,
+            "memory": memory,
+            "environment_var": env_vars,
+            "port": port_configs,
+        }
+        if command:
+            container_kwargs["command"] = command
+        if args:
+            container_kwargs["arg"] = args
+
+        container = eci_models.CreateContainerGroupRequestContainer(**container_kwargs)
 
         request = eci_models.CreateContainerGroupRequest(
             region_id=self.region_id,

@@ -85,7 +85,9 @@ def main() -> None:
             break
         time.sleep(5)
     else:
-        log = sandbox.exec_command(["/bin/sh", "-c", "tail -n 50 /tmp/ffmpeg_install.log || true"])
+        log = sandbox.exec_command(
+            ["/bin/sh", "-c", "tail -n 50 /tmp/ffmpeg_install.log || true"]
+        )
         raise RuntimeError(f"Install timed out. Log:\n{log.output}")
 
 
