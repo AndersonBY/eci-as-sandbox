@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import os
 import random
@@ -591,9 +592,15 @@ class EciSandbox:
         if exec_dir:
             command = f"cd {shlex.quote(exec_dir)} && {command}"
         # Encode command as base64 to preserve heredoc, special characters, etc.
-        # The command is decoded and piped to bash in the container
+        # The command is decoded and piped to bash in the container.
+        # For long commands, use gzip compression to stay within ECI's 2048 byte limit.
         encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
         wrapper = f"echo {encoded} | base64 -d | bash"
+        if len(wrapper) > 1900:
+            # Use gzip compression for long commands
+            compressed = gzip.compress(command.encode("utf-8"))
+            encoded = base64.b64encode(compressed).decode("ascii")
+            wrapper = f"echo {encoded} | base64 -d | gunzip | bash"
         return self.exec_command(
             sandbox_id=sandbox_id,
             command=["bash", "-lc", wrapper],
