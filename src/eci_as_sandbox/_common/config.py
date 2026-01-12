@@ -17,11 +17,19 @@ class Config:
         self.region_id = region_id
 
 
+DEFAULT_REGION = "cn-shanghai"
+
+
+def _get_endpoint_for_region(region_id: str) -> str:
+    """Generate ECI endpoint URL for a given region."""
+    return f"eci.{region_id}.aliyuncs.com"
+
+
 def _default_config() -> Dict[str, Any]:
     return {
-        "endpoint": "eci.cn-shanghai.aliyuncs.com",
+        "endpoint": _get_endpoint_for_region(DEFAULT_REGION),
         "timeout_ms": 60000,
-        "region_id": None,
+        "region_id": DEFAULT_REGION,
     }
 
 
@@ -75,8 +83,11 @@ def _load_config(
     except Exception as exc:
         _logger.warning("Failed to load .env: %s", exc)
 
+    # Track if endpoint was explicitly set
+    explicit_endpoint = False
     if endpoint := os.getenv("ECI_SANDBOX_ENDPOINT"):
         config["endpoint"] = endpoint
+        explicit_endpoint = True
     if timeout_ms := os.getenv("ECI_SANDBOX_TIMEOUT_MS"):
         try:
             config["timeout_ms"] = int(timeout_ms)
@@ -85,5 +96,8 @@ def _load_config(
     region = os.getenv("ECI_SANDBOX_REGION_ID") or os.getenv("ALIBABA_CLOUD_REGION_ID")
     if region:
         config["region_id"] = region
+        # Auto-generate endpoint if region is set but endpoint was not explicitly set
+        if not explicit_endpoint:
+            config["endpoint"] = _get_endpoint_for_region(region)
 
     return config
