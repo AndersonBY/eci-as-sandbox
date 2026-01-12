@@ -1,8 +1,31 @@
+from enum import Enum
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .._async.sandbox import AsyncSandbox
     from .._sync.sandbox import Sandbox
+
+
+# Tmux Configuration Constants
+TMUX_SESSION_PREFIX = "eci_cmd_"
+TMUX_HISTORY_LIMIT = 50000
+TMUX_OUTPUT_TAIL_LINES = 10000
+TMUX_MARKER_EXIT_CODE = "__ECI_MARKER_EXIT_CODE__"
+
+# Polling Strategy Constants
+TMUX_POLL_INITIAL_DELAY = 0.1  # 100ms
+TMUX_POLL_MAX_DELAY = 5.0  # 5 seconds
+TMUX_POLL_BACKOFF_FACTOR = 1.5
+TMUX_DEFAULT_TIMEOUT = 600.0  # 10 minutes
+
+
+class TmuxCommandStatus(Enum):
+    """Status of a tmux command execution."""
+
+    RUNNING = "running"  # Command is still executing
+    COMPLETED = "completed"  # Command finished (exit code available)
+    NOT_FOUND = "not_found"  # Session does not exist
+    ERROR = "error"  # Error occurred during polling
 
 
 class ApiResponse:
@@ -129,6 +152,58 @@ class CommandResult(ApiResponse):
         self.error_message = error_message
         self.http_url = http_url
         self.websocket_url = websocket_url
+
+
+class TmuxStartResult(ApiResponse):
+    """Result of starting a tmux command."""
+
+    def __init__(
+        self,
+        request_id: str = "",
+        success: bool = False,
+        session_id: str = "",
+        error_message: str = "",
+    ):
+        super().__init__(request_id)
+        self.success = success
+        self.session_id = session_id
+        self.error_message = error_message
+
+
+class TmuxPollResult(ApiResponse):
+    """Result of polling a tmux command."""
+
+    def __init__(
+        self,
+        request_id: str = "",
+        success: bool = False,
+        status: TmuxCommandStatus = TmuxCommandStatus.ERROR,
+        exit_code: Optional[int] = None,
+        output: str = "",
+        output_truncated: bool = False,
+        error_message: str = "",
+    ):
+        super().__init__(request_id)
+        self.success = success
+        self.status = status
+        self.exit_code = exit_code
+        self.output = output
+        self.output_truncated = output_truncated
+        self.error_message = error_message
+
+
+class TmuxKillResult(ApiResponse):
+    """Result of killing a tmux session."""
+
+    def __init__(
+        self,
+        request_id: str = "",
+        success: bool = False,
+        error_message: str = "",
+    ):
+        super().__init__(request_id)
+        self.success = success
+        self.error_message = error_message
 
 
 class SandboxInfo:

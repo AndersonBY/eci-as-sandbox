@@ -8,6 +8,7 @@ import random
 import shlex
 import string
 import time
+import uuid
 from typing import Any, Dict, Optional
 
 from alibabacloud_eci20180808 import models as eci_models
@@ -31,6 +32,18 @@ from .._common.models import (
     SandboxInfo,
     SandboxListResult,
     SandboxResult,
+    TmuxCommandStatus,
+    TmuxKillResult,
+    TmuxPollResult,
+    TmuxStartResult,
+    TMUX_DEFAULT_TIMEOUT,
+    TMUX_HISTORY_LIMIT,
+    TMUX_MARKER_EXIT_CODE,
+    TMUX_OUTPUT_TAIL_LINES,
+    TMUX_POLL_BACKOFF_FACTOR,
+    TMUX_POLL_INITIAL_DELAY,
+    TMUX_POLL_MAX_DELAY,
+    TMUX_SESSION_PREFIX,
     extract_request_id,
 )
 from .._common.ws import decode_ws_message
@@ -724,3 +737,375 @@ class EciSandbox:
             return body.get("SyncResponse", "") or ""
         except Exception:
             return ""
+
+    # ==================== Tmux Methods ====================
+
+    def tmux_start(
+        self,
+        sandbox_id: str,
+        command: str,
+        exec_dir: Optional[str] = None,
+        container_name: Optional[str] = None,
+        session_id: Optional[str] = None,
+        history_limit: int = TMUX_HISTORY_LIMIT,
+    ) -> TmuxStartResult:
+        """
+        Start a command in a tmux session (non-blocking).
+
+        Args:
+            sandbox_id: The sandbox container ID
+            command: Shell command to execute
+            exec_dir: Working directory for command execution
+            container_name: Container name (auto-resolved if not provided)
+            session_id: Custom session ID (auto-generated if not provided)
+            history_limit: tmux scrollback buffer size
+
+        Returns:
+            TmuxStartResult with session_id on success
+        """
+        if not sandbox_id:
+            return TmuxStartResult(success=False, error_message="sandbox_id is required")
+        if not command:
+            return TmuxStartResult(success=False, error_message="command is required")
+
+        if not container_name:
+            container_name = self._resolve_container_name(sandbox_id)
+        if not container_name:
+            return TmuxStartResult(success=False, error_message="container_name is required")
+
+        # Generate unique session ID if not provided
+        if not session_id:
+            session_id = f"{TMUX_SESSION_PREFIX}{uuid.uuid4().hex[:12]}"
+
+        # Build marker for completion detection
+        marker = f"{TMUX_MARKER_EXIT_CODE}{session_id}__"
+
+        # Build the command with exec_dir and completion marker
+        inner_cmd = command
+        if exec_dir:
+            inner_cmd = f"cd {shlex.quote(exec_dir)} && {command}"
+
+        # Wrap command to capture exit code and output completion marker
+        wrapped_cmd = f'''{inner_cmd}
+__exit_code__=$?
+echo ""
+echo "{marker}$__exit_code__"'''
+
+        # Create tmux session with the command
+        # Use new-session -d (detached) -s (session name)
+        # Set history-limit for scrollback buffer
+        tmux_cmd = f'''tmux new-session -d -s {shlex.quote(session_id)} \\
+  "tmux set-option -g history-limit {history_limit}; bash -lc {shlex.quote(wrapped_cmd)}"'''
+
+        # Execute via existing bash() method
+        result = self.bash(
+            sandbox_id=sandbox_id,
+            command=tmux_cmd,
+            container_name=container_name,
+            sync=True,
+            timeout=30,
+        )
+
+        if not result.success:
+            return TmuxStartResult(
+                request_id=result.request_id,
+                success=False,
+                error_message=f"Failed to start tmux session: {result.error_message or result.output}",
+            )
+
+        # Verify session was created
+        verify_cmd = f"tmux has-session -t {shlex.quote(session_id)} 2>/dev/null && echo 'EXISTS' || echo 'NOT_FOUND'"
+        verify_result = self.bash(
+            sandbox_id=sandbox_id,
+            command=verify_cmd,
+            container_name=container_name,
+            sync=True,
+            timeout=10,
+        )
+
+        if "EXISTS" not in (verify_result.output or ""):
+            return TmuxStartResult(
+                request_id=result.request_id,
+                success=False,
+                error_message="Session created but verification failed",
+            )
+
+        return TmuxStartResult(
+            request_id=result.request_id,
+            success=True,
+            session_id=session_id,
+        )
+
+    def tmux_poll(
+        self,
+        sandbox_id: str,
+        session_id: str,
+        container_name: Optional[str] = None,
+        tail_lines: int = TMUX_OUTPUT_TAIL_LINES,
+    ) -> TmuxPollResult:
+        """
+        Poll for command completion and retrieve output.
+
+        Args:
+            sandbox_id: The sandbox container ID
+            session_id: The tmux session ID from tmux_start()
+            container_name: Container name (auto-resolved if not provided)
+            tail_lines: Number of lines to retrieve from output
+
+        Returns:
+            TmuxPollResult with status, exit_code (if completed), and output
+        """
+        if not sandbox_id:
+            return TmuxPollResult(success=False, error_message="sandbox_id is required")
+        if not session_id:
+            return TmuxPollResult(success=False, error_message="session_id is required")
+
+        if not container_name:
+            container_name = self._resolve_container_name(sandbox_id)
+        if not container_name:
+            return TmuxPollResult(success=False, error_message="container_name is required")
+
+        # Check if session exists
+        check_cmd = f"tmux has-session -t {shlex.quote(session_id)} 2>/dev/null && echo 'EXISTS' || echo 'NOT_FOUND'"
+        check_result = self.bash(
+            sandbox_id=sandbox_id,
+            command=check_cmd,
+            container_name=container_name,
+            sync=True,
+            timeout=10,
+        )
+
+        if "NOT_FOUND" in (check_result.output or ""):
+            return TmuxPollResult(
+                request_id=check_result.request_id,
+                success=True,
+                status=TmuxCommandStatus.NOT_FOUND,
+                error_message="Session does not exist (may have been cleaned up)",
+            )
+
+        # Capture output from tmux pane
+        # capture-pane -p prints to stdout, -S - starts from beginning of history
+        capture_cmd = f"tmux capture-pane -t {shlex.quote(session_id)} -p -S - 2>/dev/null | tail -n {tail_lines}"
+        capture_result = self.bash(
+            sandbox_id=sandbox_id,
+            command=capture_cmd,
+            container_name=container_name,
+            sync=True,
+            timeout=30,
+        )
+
+        if not capture_result.success:
+            return TmuxPollResult(
+                request_id=capture_result.request_id,
+                success=False,
+                status=TmuxCommandStatus.ERROR,
+                error_message=f"Failed to capture output: {capture_result.error_message}",
+            )
+
+        output = capture_result.output or ""
+        marker = f"{TMUX_MARKER_EXIT_CODE}{session_id}__"
+
+        # Check for completion marker in output
+        if marker in output:
+            # Extract exit code from marker line
+            lines = output.split("\n")
+            exit_code: Optional[int] = None
+            clean_output_lines: list[str] = []
+
+            for line in lines:
+                if marker in line:
+                    # Extract exit code after marker
+                    try:
+                        exit_code_str = line.split(marker)[-1].strip()
+                        exit_code = int(exit_code_str)
+                    except (ValueError, IndexError):
+                        exit_code = -1  # Unknown exit code
+                else:
+                    clean_output_lines.append(line)
+
+            # Remove trailing empty lines
+            while clean_output_lines and not clean_output_lines[-1].strip():
+                clean_output_lines.pop()
+
+            clean_output = "\n".join(clean_output_lines)
+
+            return TmuxPollResult(
+                request_id=capture_result.request_id,
+                success=True,
+                status=TmuxCommandStatus.COMPLETED,
+                exit_code=exit_code,
+                output=clean_output,
+                output_truncated=len(lines) >= tail_lines,
+            )
+
+        # Command still running - return partial output
+        return TmuxPollResult(
+            request_id=capture_result.request_id,
+            success=True,
+            status=TmuxCommandStatus.RUNNING,
+            output=output,
+            output_truncated=len(output.split("\n")) >= tail_lines,
+        )
+
+    def tmux_wait(
+        self,
+        sandbox_id: str,
+        session_id: str,
+        container_name: Optional[str] = None,
+        timeout: Optional[float] = None,
+        poll_interval: float = TMUX_POLL_INITIAL_DELAY,
+        max_poll_interval: float = TMUX_POLL_MAX_DELAY,
+        backoff_factor: float = TMUX_POLL_BACKOFF_FACTOR,
+        tail_lines: int = TMUX_OUTPUT_TAIL_LINES,
+        cleanup: bool = True,
+    ) -> TmuxPollResult:
+        """
+        Wait for command completion with exponential backoff polling.
+
+        Args:
+            sandbox_id: The sandbox container ID
+            session_id: The tmux session ID
+            container_name: Container name
+            timeout: Maximum time to wait (None = use default)
+            poll_interval: Initial polling interval
+            max_poll_interval: Maximum polling interval
+            backoff_factor: Multiplier for exponential backoff
+            tail_lines: Lines to retrieve from output
+            cleanup: Whether to kill the session after completion
+
+        Returns:
+            TmuxPollResult with final status and output
+        """
+        if timeout is None:
+            timeout = TMUX_DEFAULT_TIMEOUT
+
+        start_time = time.monotonic()
+        current_interval = poll_interval
+
+        while True:
+            # Check timeout
+            elapsed = time.monotonic() - start_time
+            if elapsed >= timeout:
+                # Timeout - get final output and optionally cleanup
+                poll_result = self.tmux_poll(sandbox_id, session_id, container_name, tail_lines)
+                if cleanup:
+                    self.tmux_kill(sandbox_id, session_id, container_name)
+                return TmuxPollResult(
+                    request_id=poll_result.request_id,
+                    success=False,
+                    status=TmuxCommandStatus.RUNNING,
+                    output=poll_result.output,
+                    output_truncated=poll_result.output_truncated,
+                    error_message=f"Timeout after {elapsed:.1f}s",
+                )
+
+            # Poll for status
+            poll_result = self.tmux_poll(sandbox_id, session_id, container_name, tail_lines)
+
+            if not poll_result.success:
+                return poll_result
+
+            if poll_result.status == TmuxCommandStatus.COMPLETED:
+                if cleanup:
+                    self.tmux_kill(sandbox_id, session_id, container_name)
+                return poll_result
+
+            if poll_result.status == TmuxCommandStatus.NOT_FOUND:
+                return poll_result
+
+            # Still running - wait with backoff
+            time.sleep(current_interval)
+            current_interval = min(current_interval * backoff_factor, max_poll_interval)
+
+    def tmux_kill(
+        self,
+        sandbox_id: str,
+        session_id: str,
+        container_name: Optional[str] = None,
+    ) -> TmuxKillResult:
+        """
+        Kill a tmux session and clean up resources.
+
+        Args:
+            sandbox_id: The sandbox container ID
+            session_id: The tmux session ID to kill
+            container_name: Container name
+
+        Returns:
+            TmuxKillResult indicating success/failure
+        """
+        if not sandbox_id:
+            return TmuxKillResult(success=False, error_message="sandbox_id is required")
+        if not session_id:
+            return TmuxKillResult(success=False, error_message="session_id is required")
+
+        if not container_name:
+            container_name = self._resolve_container_name(sandbox_id)
+
+        kill_cmd = f"tmux kill-session -t {shlex.quote(session_id)} 2>/dev/null || true"
+        result = self.bash(
+            sandbox_id=sandbox_id,
+            command=kill_cmd,
+            container_name=container_name,
+            sync=True,
+            timeout=10,
+        )
+
+        return TmuxKillResult(
+            request_id=result.request_id,
+            success=True,  # Always succeed (idempotent)
+        )
+
+    def tmux_list(
+        self,
+        sandbox_id: str,
+        container_name: Optional[str] = None,
+    ) -> OperationResult:
+        """
+        List all tmux sessions in the sandbox.
+
+        Args:
+            sandbox_id: The sandbox container ID
+            container_name: Container name
+
+        Returns:
+            OperationResult with data containing list of session info dicts
+        """
+        if not sandbox_id:
+            return OperationResult(success=False, error_message="sandbox_id is required")
+
+        if not container_name:
+            container_name = self._resolve_container_name(sandbox_id)
+
+        list_cmd = "tmux list-sessions -F '#{session_name}:#{session_created}:#{session_attached}' 2>/dev/null || echo ''"
+        result = self.bash(
+            sandbox_id=sandbox_id,
+            command=list_cmd,
+            container_name=container_name,
+            sync=True,
+            timeout=10,
+        )
+
+        if not result.success:
+            return OperationResult(
+                request_id=result.request_id,
+                success=False,
+                error_message=result.error_message,
+            )
+
+        sessions: list[dict[str, Any]] = []
+        for line in (result.output or "").strip().split("\n"):
+            if ":" in line:
+                parts = line.split(":")
+                if len(parts) >= 3:
+                    sessions.append({
+                        "session_id": parts[0],
+                        "created": parts[1],
+                        "attached": parts[2] == "1",
+                    })
+
+        return OperationResult(
+            request_id=result.request_id,
+            success=True,
+            data=sessions,
+        )
