@@ -111,3 +111,96 @@ print(result.output)
 result = client.list(limit=10, status="Running")
 print(result.sandbox_ids)
 ```
+
+## Long command execution (WebSocket)
+
+ECI's API has a 2048-byte command limit. For longer commands, use `bash_ws` which sends commands through WebSocket stdin (no length limit).
+
+```python
+# Execute a very long command (e.g., inline Python script)
+long_script = """python3 << 'EOF'
+import json
+# ... hundreds of lines of code ...
+print(json.dumps({"status": "done"}))
+EOF
+"""
+
+result = client.bash_ws(
+    sandbox_id=sandbox_id,
+    command=long_script,
+    exec_dir="/workspace",
+    timeout=60,
+)
+print(result.output)
+```
+
+`write_file_ws` writes large content to a file via WebSocket:
+
+```python
+result = client.write_file_ws(
+    sandbox_id=sandbox_id,
+    file_path="/tmp/large_script.py",
+    content="# Very long file content...\n" * 1000,
+    timeout=30,
+)
+```
+
+## Tmux session management
+
+For non-blocking command execution with output capture, use tmux methods. Long commands are automatically handled via WebSocket file transfer.
+
+```python
+# Start a command in tmux (non-blocking)
+start_result = client.tmux_start(
+    sandbox_id=sandbox_id,
+    command="python train.py --epochs 100",
+    exec_dir="/workspace",
+)
+print(f"Session: {start_result.session_id}")
+
+# Poll for status and partial output
+poll_result = client.tmux_poll(
+    sandbox_id=sandbox_id,
+    session_id=start_result.session_id,
+)
+print(f"Status: {poll_result.status}")  # RUNNING, COMPLETED, NOT_FOUND
+print(f"Output: {poll_result.output}")
+
+# Wait for completion with exponential backoff
+wait_result = client.tmux_wait(
+    sandbox_id=sandbox_id,
+    session_id=start_result.session_id,
+    timeout=300,  # max wait time
+)
+print(f"Exit code: {wait_result.exit_code}")
+print(f"Output: {wait_result.output}")
+
+# Kill a session manually
+client.tmux_kill(sandbox_id=sandbox_id, session_id=start_result.session_id)
+
+# List all tmux sessions
+list_result = client.tmux_list(sandbox_id=sandbox_id)
+print(list_result.data)  # [{"session_id": "...", "created": "...", "attached": False}]
+```
+
+## API Reference
+
+### Client Methods
+
+| Method | Description |
+|--------|-------------|
+| `create(image, name, cpu, memory, ...)` | Create a new sandbox container |
+| `get(sandbox_id)` | Get sandbox instance by ID |
+| `get_sandbox(sandbox_id)` | Get sandbox info |
+| `list(limit, status, tags, ...)` | List sandboxes |
+| `delete(sandbox_id, force)` | Delete a sandbox |
+| `restart(sandbox_id)` | Restart a sandbox |
+| `exec_command(sandbox_id, command, ...)` | Execute command (list form) |
+| `bash(sandbox_id, command, exec_dir, ...)` | Execute bash command |
+| `bash_ws(sandbox_id, command, exec_dir, ...)` | Execute bash via WebSocket (unlimited length) |
+| `write_file_ws(sandbox_id, file_path, content, ...)` | Write file via WebSocket (unlimited length) |
+| `tmux_start(sandbox_id, command, ...)` | Start command in tmux session |
+| `tmux_poll(sandbox_id, session_id, ...)` | Poll tmux session status |
+| `tmux_wait(sandbox_id, session_id, timeout, ...)` | Wait for tmux session completion |
+| `tmux_kill(sandbox_id, session_id)` | Kill tmux session |
+| `tmux_list(sandbox_id)` | List all tmux sessions |

@@ -111,3 +111,96 @@ print(result.output)
 result = client.list(limit=10, status="Running")
 print(result.sandbox_ids)
 ```
+
+## 长命令执行（WebSocket）
+
+ECI 的 API 有 2048 字节的命令长度限制。对于更长的命令，使用 `bash_ws` 通过 WebSocket stdin 发送命令（无长度限制）。
+
+```python
+# 执行超长命令（如内嵌 Python 脚本）
+long_script = """python3 << 'EOF'
+import json
+# ... 数百行代码 ...
+print(json.dumps({"status": "done"}))
+EOF
+"""
+
+result = client.bash_ws(
+    sandbox_id=sandbox_id,
+    command=long_script,
+    exec_dir="/workspace",
+    timeout=60,
+)
+print(result.output)
+```
+
+`write_file_ws` 通过 WebSocket 写入大文件：
+
+```python
+result = client.write_file_ws(
+    sandbox_id=sandbox_id,
+    file_path="/tmp/large_script.py",
+    content="# 很长的文件内容...\n" * 1000,
+    timeout=30,
+)
+```
+
+## Tmux 会话管理
+
+对于非阻塞命令执行和输出捕获，使用 tmux 方法。长命令会自动通过 WebSocket 文件传输处理。
+
+```python
+# 在 tmux 中启动命令（非阻塞）
+start_result = client.tmux_start(
+    sandbox_id=sandbox_id,
+    command="python train.py --epochs 100",
+    exec_dir="/workspace",
+)
+print(f"会话 ID: {start_result.session_id}")
+
+# 轮询状态和部分输出
+poll_result = client.tmux_poll(
+    sandbox_id=sandbox_id,
+    session_id=start_result.session_id,
+)
+print(f"状态: {poll_result.status}")  # RUNNING, COMPLETED, NOT_FOUND
+print(f"输出: {poll_result.output}")
+
+# 等待命令完成（指数退避轮询）
+wait_result = client.tmux_wait(
+    sandbox_id=sandbox_id,
+    session_id=start_result.session_id,
+    timeout=300,  # 最大等待时间
+)
+print(f"退出码: {wait_result.exit_code}")
+print(f"输出: {wait_result.output}")
+
+# 手动终止会话
+client.tmux_kill(sandbox_id=sandbox_id, session_id=start_result.session_id)
+
+# 列出所有 tmux 会话
+list_result = client.tmux_list(sandbox_id=sandbox_id)
+print(list_result.data)  # [{"session_id": "...", "created": "...", "attached": False}]
+```
+
+## API 参考
+
+### 客户端方法
+
+| 方法 | 说明 |
+|------|------|
+| `create(image, name, cpu, memory, ...)` | 创建新的沙箱容器 |
+| `get(sandbox_id)` | 通过 ID 获取沙箱实例 |
+| `get_sandbox(sandbox_id)` | 获取沙箱信息 |
+| `list(limit, status, tags, ...)` | 列出沙箱 |
+| `delete(sandbox_id, force)` | 删除沙箱 |
+| `restart(sandbox_id)` | 重启沙箱 |
+| `exec_command(sandbox_id, command, ...)` | 执行命令（列表形式） |
+| `bash(sandbox_id, command, exec_dir, ...)` | 执行 bash 命令 |
+| `bash_ws(sandbox_id, command, exec_dir, ...)` | 通过 WebSocket 执行 bash（无长度限制） |
+| `write_file_ws(sandbox_id, file_path, content, ...)` | 通过 WebSocket 写文件（无长度限制） |
+| `tmux_start(sandbox_id, command, ...)` | 在 tmux 会话中启动命令 |
+| `tmux_poll(sandbox_id, session_id, ...)` | 轮询 tmux 会话状态 |
+| `tmux_wait(sandbox_id, session_id, timeout, ...)` | 等待 tmux 会话完成 |
+| `tmux_kill(sandbox_id, session_id)` | 终止 tmux 会话 |
+| `tmux_list(sandbox_id)` | 列出所有 tmux 会话 |
