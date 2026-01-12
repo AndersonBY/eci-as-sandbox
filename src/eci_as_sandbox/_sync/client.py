@@ -46,7 +46,7 @@ from .._common.models import (
     TMUX_SESSION_PREFIX,
     extract_request_id,
 )
-from .._common.ws import decode_ws_message
+from .._common.ws import decode_ws_message, encode_ws_stdin
 from .sandbox import Sandbox
 
 
@@ -738,7 +738,247 @@ class EciSandbox:
         except Exception:
             return ""
 
+    # ==================== WebSocket Methods ====================
+
+    def _exec_via_ws(
+        self,
+        sandbox_id: str,
+        command: str,
+        container_name: str,
+        timeout: float,
+    ) -> CommandResult:
+        """
+        Execute a command via WebSocket stdin (no length limit).
+
+        This method:
+        1. Starts an interactive bash shell with stdin=True
+        2. Gets the WebSocket URL
+        3. Sends the full command through WebSocket stdin
+        4. Reads output until completion
+
+        Args:
+            sandbox_id: The sandbox container ID
+            command: The full bash command to execute (any length)
+            container_name: Container name
+            timeout: Timeout in seconds
+
+        Returns:
+            CommandResult with output
+        """
+        # Start a bash shell with stdin enabled
+        shell_cmd = ["bash", "-l"]
+        command_json = json.dumps(shell_cmd, ensure_ascii=False)
+
+        try:
+            request = eci_models.ExecContainerCommandRequest(
+                region_id=self.region_id,
+                container_group_id=sandbox_id,
+                container_name=container_name,
+                command=command_json,
+                sync=False,
+                tty=False,
+                stdin=True,  # Enable stdin for sending commands
+            )
+            response = self.client.exec_container_command(request)
+            request_id = extract_request_id(response)
+            body = response.to_map().get("body", {})
+            websocket_url = body.get("WebSocketUri", "")
+
+            if not websocket_url:
+                return CommandResult(
+                    request_id=request_id,
+                    success=False,
+                    error_message="WebSocketUri not returned for interactive exec.",
+                )
+
+            # Execute command via WebSocket
+            output = self._send_command_via_ws(websocket_url, command, timeout)
+
+            return CommandResult(
+                request_id=request_id,
+                success=True,
+                output=output,
+                websocket_url=websocket_url,
+            )
+
+        except Exception as exc:
+            _log_operation_error("ExecViaWS", str(exc), exc_info=True)
+            return CommandResult(
+                request_id="",
+                success=False,
+                error_message=f"Failed to exec via WebSocket: {exc}",
+            )
+
+    def _send_command_via_ws(
+        self,
+        websocket_url: str,
+        command: str,
+        timeout: float,
+    ) -> str:
+        """
+        Send command through WebSocket and read output.
+
+        Args:
+            websocket_url: The WebSocket URL from ExecContainerCommand
+            command: The command to send
+            timeout: Timeout in seconds
+
+        Returns:
+            Command output as string
+        """
+        try:
+            import websocket
+        except Exception as exc:
+            raise RuntimeError(
+                "websocket-client is required for WebSocket exec."
+            ) from exc
+
+        output_chunks: list[str] = []
+        end_time = time.monotonic() + timeout
+
+        ws = websocket.create_connection(websocket_url, timeout=5)
+        try:
+            # Send the command followed by exit to ensure shell terminates
+            # Use heredoc style to handle multi-line commands properly
+            full_command = f"{command}\nexit $?\n"
+            ws.send(encode_ws_stdin(full_command), opcode=websocket.ABNF.OPCODE_BINARY)
+
+            # Read output until connection closes or timeout
+            while time.monotonic() < end_time:
+                remaining = end_time - time.monotonic()
+                ws.settimeout(min(1.0, remaining))
+                try:
+                    message = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except websocket.WebSocketConnectionClosedException:
+                    break
+                if message is None:
+                    break
+                decoded = decode_ws_message(message)
+                if decoded:
+                    output_chunks.append(decoded)
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        return "".join(output_chunks)
+
+    def bash_ws(
+        self,
+        sandbox_id: str,
+        command: str,
+        exec_dir: Optional[str] = None,
+        container_name: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> CommandResult:
+        """
+        Execute a bash command via WebSocket (supports unlimited command length).
+
+        This method is useful for very long commands that exceed ECI's 2048 byte
+        API limit. It uses WebSocket stdin to send the command, bypassing the limit.
+
+        Args:
+            sandbox_id: The sandbox container ID
+            command: The bash command to execute (any length)
+            exec_dir: Working directory for command execution
+            container_name: Container name (auto-resolved if not provided)
+            timeout: Timeout in seconds (default 600)
+
+        Returns:
+            CommandResult with output
+        """
+        if not sandbox_id:
+            return CommandResult(success=False, error_message="sandbox_id is required")
+        if not command:
+            return CommandResult(success=False, error_message="command is required")
+
+        if not container_name:
+            container_name = self._resolve_container_name(sandbox_id)
+        if not container_name:
+            return CommandResult(success=False, error_message="container_name is required")
+
+        if timeout is None:
+            timeout = _DEFAULT_SYNC_TIMEOUT
+
+        # Build full command with exec_dir
+        full_command = command
+        if exec_dir:
+            full_command = f"cd {shlex.quote(exec_dir)} && {command}"
+
+        _log_api_call(
+            "BashViaWS",
+            f"ContainerGroupId={sandbox_id}, CmdLen={len(full_command)}",
+        )
+
+        return self._exec_via_ws(
+            sandbox_id=sandbox_id,
+            command=full_command,
+            container_name=container_name,
+            timeout=timeout,
+        )
+
+    def write_file_ws(
+        self,
+        sandbox_id: str,
+        file_path: str,
+        content: str,
+        container_name: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> CommandResult:
+        """
+        Write content to a file via WebSocket (supports unlimited content length).
+
+        This method is useful for writing large files that would exceed the
+        command length limit if done via normal bash commands.
+
+        Args:
+            sandbox_id: The sandbox container ID
+            file_path: Absolute path to the file to write
+            content: File content to write
+            container_name: Container name (auto-resolved if not provided)
+            timeout: Timeout in seconds (default 60)
+
+        Returns:
+            CommandResult indicating success/failure
+        """
+        if not sandbox_id:
+            return CommandResult(success=False, error_message="sandbox_id is required")
+        if not file_path:
+            return CommandResult(success=False, error_message="file_path is required")
+
+        if not container_name:
+            container_name = self._resolve_container_name(sandbox_id)
+        if not container_name:
+            return CommandResult(success=False, error_message="container_name is required")
+
+        if timeout is None:
+            timeout = 60.0
+
+        # Use cat with heredoc to write file content
+        # Generate a unique EOF marker that won't appear in the content
+        eof_marker = "EOF_WRITE_FILE"
+        counter = 0
+        while eof_marker in content:
+            counter += 1
+            eof_marker = f"EOF_WRITE_FILE_{counter}"
+
+        write_command = f"cat > {shlex.quote(file_path)} << '{eof_marker}'\n{content}\n{eof_marker}"
+
+        return self._exec_via_ws(
+            sandbox_id=sandbox_id,
+            command=write_command,
+            container_name=container_name,
+            timeout=timeout,
+        )
+
     # ==================== Tmux Methods ====================
+
+    # Threshold for using file-based execution in tmux_start
+    # If base64-encoded command exceeds this, use write_file_ws instead
+    _TMUX_CMD_LENGTH_THRESHOLD = 1200
 
     def tmux_start(
         self,
@@ -752,9 +992,13 @@ class EciSandbox:
         """
         Start a command in a tmux session (non-blocking).
 
+        For long commands that would exceed ECI's 2048 byte API limit,
+        this method automatically uses WebSocket to write the command
+        to a temporary script file, then executes that file in tmux.
+
         Args:
             sandbox_id: The sandbox container ID
-            command: Shell command to execute
+            command: Shell command to execute (any length supported)
             exec_dir: Working directory for command execution
             container_name: Container name (auto-resolved if not provided)
             session_id: Custom session ID (auto-generated if not provided)
@@ -792,10 +1036,21 @@ __exit_code__=$?
 echo ""
 echo "{marker}$__exit_code__"'''
 
-        # Create tmux session with the command
-        # Use base64 encoding to avoid shell quoting issues with complex commands
-        # Set remain-on-exit so the pane stays open after command completes (for output capture)
+        # Check if command is too long for direct base64 encoding
         encoded_cmd = base64.b64encode(wrapped_cmd.encode("utf-8")).decode("ascii")
+
+        if len(encoded_cmd) > self._TMUX_CMD_LENGTH_THRESHOLD:
+            # Use file-based execution for long commands
+            return self._tmux_start_via_file(
+                sandbox_id=sandbox_id,
+                wrapped_cmd=wrapped_cmd,
+                session_id=session_id,
+                container_name=container_name,
+            )
+
+        # Short command: use direct base64 encoding
+        # Create tmux session with the command
+        # Set remain-on-exit so the pane stays open after command completes (for output capture)
         tmux_cmd = (
             f'tmux new-session -d -s {shlex.quote(session_id)} "echo {encoded_cmd} | base64 -d | bash -l"; '
             f'tmux set-option -t {shlex.quote(session_id)} remain-on-exit on 2>/dev/null || true'
@@ -818,6 +1073,91 @@ echo "{marker}$__exit_code__"'''
             )
 
         # Verify session was created
+        return self._verify_tmux_session(sandbox_id, session_id, container_name, result.request_id)
+
+    def _tmux_start_via_file(
+        self,
+        sandbox_id: str,
+        wrapped_cmd: str,
+        session_id: str,
+        container_name: str,
+    ) -> TmuxStartResult:
+        """
+        Start a long command in tmux by writing it to a temporary script file first.
+
+        This method uses WebSocket to write the command to a file (bypassing the
+        2048 byte API limit), then starts tmux to execute that file.
+
+        Args:
+            sandbox_id: The sandbox container ID
+            wrapped_cmd: The wrapped command (with exit code capture)
+            session_id: The tmux session ID
+            container_name: Container name
+
+        Returns:
+            TmuxStartResult with session_id on success
+        """
+        # Generate temporary script path
+        script_path = f"/tmp/tmux_cmd_{session_id}.sh"
+
+        # Write command to file via WebSocket (no length limit)
+        write_result = self.write_file_ws(
+            sandbox_id=sandbox_id,
+            file_path=script_path,
+            content=wrapped_cmd,
+            container_name=container_name,
+            timeout=60.0,
+        )
+
+        if not write_result.success:
+            return TmuxStartResult(
+                request_id=write_result.request_id,
+                success=False,
+                error_message=f"Failed to write script file: {write_result.error_message}",
+            )
+
+        # Make script executable and start tmux session to run it
+        # The script will be cleaned up after execution
+        tmux_cmd = (
+            f'chmod +x {shlex.quote(script_path)} && '
+            f'tmux new-session -d -s {shlex.quote(session_id)} "bash -l {shlex.quote(script_path)}; rm -f {shlex.quote(script_path)}"; '
+            f'tmux set-option -t {shlex.quote(session_id)} remain-on-exit on 2>/dev/null || true'
+        )
+
+        result = self.bash(
+            sandbox_id=sandbox_id,
+            command=tmux_cmd,
+            container_name=container_name,
+            sync=True,
+            timeout=30,
+        )
+
+        if not result.success:
+            # Clean up script file on failure
+            self.bash(
+                sandbox_id=sandbox_id,
+                command=f"rm -f {shlex.quote(script_path)}",
+                container_name=container_name,
+                sync=True,
+                timeout=10,
+            )
+            return TmuxStartResult(
+                request_id=result.request_id,
+                success=False,
+                error_message=f"Failed to start tmux session: {result.error_message or result.output}",
+            )
+
+        # Verify session was created
+        return self._verify_tmux_session(sandbox_id, session_id, container_name, result.request_id)
+
+    def _verify_tmux_session(
+        self,
+        sandbox_id: str,
+        session_id: str,
+        container_name: str,
+        request_id: str,
+    ) -> TmuxStartResult:
+        """Verify that a tmux session was successfully created."""
         verify_cmd = f"tmux has-session -t {shlex.quote(session_id)} 2>/dev/null && echo 'EXISTS' || echo 'NOT_FOUND'"
         verify_result = self.bash(
             sandbox_id=sandbox_id,
@@ -829,13 +1169,13 @@ echo "{marker}$__exit_code__"'''
 
         if "EXISTS" not in (verify_result.output or ""):
             return TmuxStartResult(
-                request_id=result.request_id,
+                request_id=request_id,
                 success=False,
                 error_message="Session created but verification failed",
             )
 
         return TmuxStartResult(
-            request_id=result.request_id,
+            request_id=request_id,
             success=True,
             session_id=session_id,
         )
