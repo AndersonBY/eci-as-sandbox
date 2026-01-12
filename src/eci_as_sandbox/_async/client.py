@@ -778,14 +778,20 @@ class AsyncEciSandbox:
             inner_cmd = f"cd {shlex.quote(exec_dir)} && {command}"
 
         # Wrap command to capture exit code and output completion marker
-        wrapped_cmd = f'''{inner_cmd}
+        # Use subshell () to capture exit code even if command uses 'exit'
+        wrapped_cmd = f'''({inner_cmd})
 __exit_code__=$?
 echo ""
 echo "{marker}$__exit_code__"'''
 
         # Create tmux session with the command
-        tmux_cmd = f'''tmux new-session -d -s {shlex.quote(session_id)} \\
-  "tmux set-option -g history-limit {history_limit}; bash -lc {shlex.quote(wrapped_cmd)}"'''
+        # Use base64 encoding to avoid shell quoting issues with complex commands
+        # Set remain-on-exit so the pane stays open after command completes (for output capture)
+        encoded_cmd = base64.b64encode(wrapped_cmd.encode("utf-8")).decode("ascii")
+        tmux_cmd = (
+            f'tmux new-session -d -s {shlex.quote(session_id)} "echo {encoded_cmd} | base64 -d | bash -l"; '
+            f'tmux set-option -t {shlex.quote(session_id)} remain-on-exit on 2>/dev/null || true'
+        )
 
         # Execute via existing bash() method
         result = await self.bash(
@@ -907,6 +913,9 @@ echo "{marker}$__exit_code__"'''
                         exit_code = int(exit_code_str)
                     except (ValueError, IndexError):
                         exit_code = -1
+                elif line.startswith("Pane is dead"):
+                    # Filter out tmux "Pane is dead" message (from remain-on-exit)
+                    pass
                 else:
                     clean_output_lines.append(line)
 
