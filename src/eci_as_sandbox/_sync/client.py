@@ -1156,28 +1156,40 @@ echo "{marker}$__exit_code__"'''
         session_id: str,
         container_name: str,
         request_id: str,
+        max_retries: int = 3,
+        retry_delay: float = 0.5,
     ) -> TmuxStartResult:
-        """Verify that a tmux session was successfully created."""
-        verify_cmd = f"tmux has-session -t {shlex.quote(session_id)} 2>/dev/null && echo 'EXISTS' || echo 'NOT_FOUND'"
-        verify_result = self.bash(
-            sandbox_id=sandbox_id,
-            command=verify_cmd,
-            container_name=container_name,
-            sync=True,
-            timeout=10,
-        )
+        """Verify that a tmux session was successfully created.
 
-        if "EXISTS" not in (verify_result.output or ""):
-            return TmuxStartResult(
-                request_id=request_id,
-                success=False,
-                error_message="Session created but verification failed",
+        Uses retry logic to handle race condition where session creation
+        may not be immediately visible to has-session check.
+        """
+        verify_cmd = f"tmux has-session -t {shlex.quote(session_id)} 2>/dev/null && echo 'EXISTS' || echo 'NOT_FOUND'"
+
+        for attempt in range(max_retries):
+            verify_result = self.bash(
+                sandbox_id=sandbox_id,
+                command=verify_cmd,
+                container_name=container_name,
+                sync=True,
+                timeout=10,
             )
+
+            if "EXISTS" in (verify_result.output or ""):
+                return TmuxStartResult(
+                    request_id=request_id,
+                    success=True,
+                    session_id=session_id,
+                )
+
+            # Session not found yet, wait before retry (except on last attempt)
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
 
         return TmuxStartResult(
             request_id=request_id,
-            success=True,
-            session_id=session_id,
+            success=False,
+            error_message="Session created but verification failed",
         )
 
     def tmux_poll(
