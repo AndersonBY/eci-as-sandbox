@@ -15,7 +15,7 @@ from alibabacloud_eci20180808.client import Client as EciClient
 from alibabacloud_tea_openapi import models as open_api_models
 from alibabacloud_tea_util import models as util_models
 
-from .._common.config import Config, _load_config
+from .._common.config import Config, _get_endpoint_for_region, _load_config
 from .._common.exceptions import AuthenticationError
 from .._common.logger import (
     _log_api_call,
@@ -84,11 +84,17 @@ class EciSandbox:
         self.access_key_secret = access_key_secret
         self.security_token = security_token
 
+        # Auto-adjust endpoint based on region_id if it differs from config
+        endpoint = config_data["endpoint"]
+        expected_endpoint = _get_endpoint_for_region(region_id)
+        if endpoint != expected_endpoint:
+            endpoint = expected_endpoint
+
         config = open_api_models.Config(
             access_key_id=access_key_id,
             access_key_secret=access_key_secret,
             security_token=security_token,
-            endpoint=config_data["endpoint"],
+            endpoint=endpoint,
             region_id=region_id,
             read_timeout=config_data["timeout_ms"],
             connect_timeout=config_data["timeout_ms"],
