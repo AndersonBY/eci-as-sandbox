@@ -63,7 +63,22 @@ class EciSandbox:
         env_file: Optional[str] = None,
         security_token: str = "",
         region_id: str = "",
+        proxy: Optional[Dict[str, Any]] = None,
     ):
+        """
+        Initialize EciSandbox client.
+
+        Args:
+            access_key_id: Alibaba Cloud access key ID
+            access_key_secret: Alibaba Cloud access key secret
+            cfg: Optional Config object
+            env_file: Optional path to .env file
+            security_token: Optional STS security token
+            region_id: Alibaba Cloud region ID
+            proxy: Optional proxy configuration dict with keys:
+                - http_proxy: HTTP proxy URL (e.g., "http://proxy:8080")
+                - https_proxy: HTTPS proxy URL (e.g., "http://proxy:8080")
+        """
         config_data = _load_config(cfg, env_file)
 
         if not access_key_id:
@@ -97,6 +112,11 @@ class EciSandbox:
         self.access_key_secret = access_key_secret
         self.security_token = security_token
 
+        # Store proxy configuration
+        self._proxy = proxy or {}
+        self._http_proxy = self._proxy.get("http_proxy")
+        self._https_proxy = self._proxy.get("https_proxy")
+
         # Auto-adjust endpoint based on region_id if it differs from config
         endpoint = config_data["endpoint"]
         expected_endpoint = _get_endpoint_for_region(region_id)
@@ -112,6 +132,14 @@ class EciSandbox:
             read_timeout=config_data["timeout_ms"],
             connect_timeout=config_data["timeout_ms"],
         )
+
+        # Configure proxy for Alibaba Cloud SDK if provided
+        if self._http_proxy or self._https_proxy:
+            # The SDK uses httpProxy and httpsProxy fields
+            if self._http_proxy:
+                config.http_proxy = self._http_proxy
+            if self._https_proxy:
+                config.https_proxy = self._https_proxy
 
         self.client = EciClient(config)
         self._sandboxes: Dict[str, Sandbox] = {}
@@ -673,6 +701,35 @@ class EciSandbox:
             return _DEFAULT_SYNC_TIMEOUT
         return min(timeout, _DEFAULT_SYNC_TIMEOUT)
 
+    def _get_ws_proxy_settings(self) -> Dict[str, Any]:
+        """
+        Parse proxy URL and return WebSocket-compatible proxy settings.
+
+        Returns:
+            Dict with http_proxy_host, http_proxy_port, and optionally
+            http_proxy_auth tuple (username, password) for websocket-client.
+        """
+        proxy_url = self._https_proxy or self._http_proxy
+        if not proxy_url:
+            return {}
+
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(proxy_url)
+            settings: Dict[str, Any] = {}
+
+            if parsed.hostname:
+                settings["http_proxy_host"] = parsed.hostname
+            if parsed.port:
+                settings["http_proxy_port"] = parsed.port
+            if parsed.username and parsed.password:
+                settings["http_proxy_auth"] = (parsed.username, parsed.password)
+
+            return settings
+        except Exception:
+            return {}
+
     def _read_ws_output(self, websocket_url: str, timeout: float) -> str:
         try:
             import websocket
@@ -683,7 +740,10 @@ class EciSandbox:
 
         output_chunks: list[str] = []
         end_time = time.monotonic() + timeout
-        ws = websocket.create_connection(websocket_url, timeout=1)
+
+        # Get proxy settings for WebSocket connection
+        proxy_settings = self._get_ws_proxy_settings()
+        ws = websocket.create_connection(websocket_url, timeout=1, **proxy_settings)
         try:
             while time.monotonic() < end_time:
                 remaining = end_time - time.monotonic()
@@ -836,7 +896,9 @@ class EciSandbox:
         output_chunks: list[str] = []
         end_time = time.monotonic() + timeout
 
-        ws = websocket.create_connection(websocket_url, timeout=5)
+        # Get proxy settings for WebSocket connection
+        proxy_settings = self._get_ws_proxy_settings()
+        ws = websocket.create_connection(websocket_url, timeout=5, **proxy_settings)
         try:
             # Send the command followed by exit to ensure shell terminates
             # Use heredoc style to handle multi-line commands properly
