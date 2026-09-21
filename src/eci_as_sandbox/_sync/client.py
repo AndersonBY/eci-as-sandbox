@@ -1093,7 +1093,10 @@ class EciSandbox:
 
         # Wrap command to capture exit code and output completion marker
         # Use subshell () to capture exit code even if command uses 'exit'
-        wrapped_cmd = f'''({inner_cmd})
+        # Configure this pane before the payload can finish. Doing this from
+        # a second client after new-session races with short-lived commands.
+        wrapped_cmd = f'''tmux set-option -p -t "$TMUX_PANE" remain-on-exit on || exit $?
+({inner_cmd})
 __exit_code__=$?
 echo ""
 echo "{marker}$__exit_code__"'''
@@ -1111,12 +1114,7 @@ echo "{marker}$__exit_code__"'''
             )
 
         # Short command: use direct base64 encoding
-        # Create tmux session with the command
-        # Set remain-on-exit so the pane stays open after command completes (for output capture)
-        tmux_cmd = (
-            f'tmux new-session -d -s {shlex.quote(session_id)} "echo {encoded_cmd} | base64 -d | bash -l"; '
-            f'tmux set-option -t {shlex.quote(session_id)} remain-on-exit on 2>/dev/null || true'
-        )
+        tmux_cmd = f'tmux new-session -d -s {shlex.quote(session_id)} "echo {encoded_cmd} | base64 -d | bash -l"'
 
         # Execute via existing bash() method
         result = self.bash(
@@ -1182,8 +1180,7 @@ echo "{marker}$__exit_code__"'''
         # The script will be cleaned up after execution
         tmux_cmd = (
             f'chmod +x {shlex.quote(script_path)} && '
-            f'tmux new-session -d -s {shlex.quote(session_id)} "bash -l {shlex.quote(script_path)}; rm -f {shlex.quote(script_path)}"; '
-            f'tmux set-option -t {shlex.quote(session_id)} remain-on-exit on 2>/dev/null || true'
+            f'tmux new-session -d -s {shlex.quote(session_id)} "bash -l {shlex.quote(script_path)}; rm -f {shlex.quote(script_path)}"'
         )
 
         result = self.bash(
