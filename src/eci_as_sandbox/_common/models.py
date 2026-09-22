@@ -145,6 +145,8 @@ class CommandResult(ApiResponse):
         error_message: str = "",
         http_url: str = "",
         websocket_url: str = "",
+        code: str = "",
+        command_dispatched: Optional[bool] = None,
     ):
         super().__init__(request_id)
         self.success = success
@@ -152,6 +154,20 @@ class CommandResult(ApiResponse):
         self.error_message = error_message
         self.http_url = http_url
         self.websocket_url = websocket_url
+        self.code = code
+        # False is positive refusal evidence, not merely the lack of a reply.
+        self.command_dispatched = command_dispatched
+
+    @classmethod
+    def from_exec_error(cls, error: Exception, *, accepted: bool, request_id: str = "") -> "CommandResult":
+        code = getattr(error, "code", "")
+        code = code if isinstance(code, str) else ""
+        lowered = code.lower()
+        rejected = lowered == "incorrectstatus" or lowered.startswith(("invalidparameter", "throttl", "forbidden", "unauthorized"))
+        return cls(
+            request_id=request_id, success=False, error_message=f"Failed to exec command: {error}",
+            code=code, command_dispatched=True if accepted else False if rejected else None,
+        )
 
 
 class TmuxStartResult(ApiResponse):
@@ -163,11 +179,15 @@ class TmuxStartResult(ApiResponse):
         success: bool = False,
         session_id: str = "",
         error_message: str = "",
+        code: str = "",
+        command_dispatched: Optional[bool] = None,
     ):
         super().__init__(request_id)
         self.success = success
         self.session_id = session_id
         self.error_message = error_message
+        self.code = code
+        self.command_dispatched = command_dispatched
 
 
 class TmuxPollResult(ApiResponse):

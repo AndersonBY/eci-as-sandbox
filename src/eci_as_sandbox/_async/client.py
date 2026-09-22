@@ -8,6 +8,7 @@ import os
 import random
 import shlex
 import string
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -500,16 +501,16 @@ class AsyncEciSandbox:
         timeout: Optional[float] = None,
     ) -> CommandResult:
         if not sandbox_id:
-            return CommandResult(success=False, error_message="sandbox_id is required")
+            return CommandResult(success=False, error_message="sandbox_id is required", code="InvalidParameter", command_dispatched=False)
         if not command:
-            return CommandResult(success=False, error_message="command is required")
+            return CommandResult(success=False, error_message="command is required", code="InvalidParameter", command_dispatched=False)
 
         if not container_name:
             container_name = await self._resolve_container_name(sandbox_id)
         if not container_name:
             return CommandResult(
                 success=False,
-                error_message="container_name is required",
+                error_message="container_name is required", code="InvalidParameter", command_dispatched=False,
             )
 
         _log_api_call(
@@ -517,6 +518,9 @@ class AsyncEciSandbox:
             f"ContainerGroupId={sandbox_id}, Container={container_name}",
         )
 
+        accepted = False
+        request_id = ""
+        deadline = time.monotonic() + self._normalize_sync_timeout(timeout)
         try:
             command_json = json.dumps(command, ensure_ascii=False)
             if sync:
@@ -525,8 +529,9 @@ class AsyncEciSandbox:
                     container_name=container_name,
                     command_json=command_json,
                     sync=False,
-                    timeout=None,
+                    timeout=max(0.001, deadline - time.monotonic()),
                 )
+                accepted = True
                 request_id = extract_request_id(response)
                 body = response.to_map().get("body", {})
                 http_url = body.get("HttpUrl", "")
@@ -538,10 +543,10 @@ class AsyncEciSandbox:
                         success=False,
                         error_message="WebSocketUri not returned for sync exec.",
                         http_url=http_url,
-                        websocket_url=websocket_url,
+                        websocket_url=websocket_url, command_dispatched=True,
                     )
                 output = await self._read_ws_output(
-                    websocket_url, self._normalize_sync_timeout(timeout)
+                    websocket_url, max(0.001, deadline - time.monotonic())
                 )
                 _log_api_response(
                     "ExecContainerCommand",
@@ -554,7 +559,7 @@ class AsyncEciSandbox:
                     success=True,
                     output=output,
                     http_url=http_url,
-                    websocket_url=websocket_url,
+                    websocket_url=websocket_url, command_dispatched=True,
                 )
 
             response = await self._exec_container_command(
@@ -562,8 +567,9 @@ class AsyncEciSandbox:
                 container_name=container_name,
                 command_json=command_json,
                 sync=sync,
-                timeout=timeout,
+                timeout=max(0.001, deadline - time.monotonic()),
             )
+            accepted = True
             request_id = extract_request_id(response)
             body = response.to_map().get("body", {})
             output = body.get("SyncResponse", "") if sync else ""
@@ -580,16 +586,11 @@ class AsyncEciSandbox:
                 success=True,
                 output=output,
                 http_url=http_url,
-                websocket_url=websocket_url,
+                websocket_url=websocket_url, command_dispatched=True,
             )
         except Exception as exc:
             _log_operation_error("ExecContainerCommand", str(exc), exc_info=True)
-            return CommandResult(
-                request_id="",
-                success=False,
-                output="",
-                error_message=f"Failed to exec command: {exc}",
-            )
+            return CommandResult.from_exec_error(exc, accepted=accepted, request_id=request_id)
 
     async def bash(
         self,
@@ -657,6 +658,7 @@ class AsyncEciSandbox:
         runtime = util_models.RuntimeOptions(
             read_timeout=timeout_ms,
             connect_timeout=timeout_ms,
+            autoretry=False,
         )
         return await self.client.exec_container_command_with_options_async(
             request, runtime
@@ -761,6 +763,9 @@ class AsyncEciSandbox:
         shell_cmd = ["bash", "-l"]
         command_json = json.dumps(shell_cmd, ensure_ascii=False)
 
+        accepted = False
+        request_id = ""
+        deadline = time.monotonic() + timeout
         try:
             request = eci_models.ExecContainerCommandRequest(
                 region_id=self.region_id,
@@ -771,7 +776,9 @@ class AsyncEciSandbox:
                 tty=False,
                 stdin=True,  # Enable stdin for sending commands
             )
-            response = await self.client.exec_container_command_async(request)
+            options = util_models.RuntimeOptions(read_timeout=max(1, int(timeout * 1000)), connect_timeout=max(1, int(timeout * 1000)), autoretry=False)
+            response = await self.client.exec_container_command_with_options_async(request, options)
+            accepted = True
             request_id = extract_request_id(response)
             body = response.to_map().get("body", {})
             websocket_url = body.get("WebSocketUri", "")
@@ -780,26 +787,22 @@ class AsyncEciSandbox:
                 return CommandResult(
                     request_id=request_id,
                     success=False,
-                    error_message="WebSocketUri not returned for interactive exec.",
+                    error_message="WebSocketUri not returned for interactive exec.", command_dispatched=False,
                 )
 
             # Execute command via WebSocket
-            output = await self._send_command_via_ws(websocket_url, command, timeout)
+            output = await self._send_command_via_ws(websocket_url, command, max(0.001, deadline - time.monotonic()))
 
             return CommandResult(
                 request_id=request_id,
                 success=True,
                 output=output,
-                websocket_url=websocket_url,
+                websocket_url=websocket_url, command_dispatched=True,
             )
 
         except Exception as exc:
             _log_operation_error("ExecViaWS", str(exc), exc_info=True)
-            return CommandResult(
-                request_id="",
-                success=False,
-                error_message=f"Failed to exec via WebSocket: {exc}",
-            )
+            return CommandResult.from_exec_error(exc, accepted=accepted, request_id=request_id)
 
     async def _send_command_via_ws(
         self,
@@ -1055,6 +1058,7 @@ echo "{marker}$__exit_code__"'''
                 request_id=result.request_id,
                 success=False,
                 error_message=f"Failed to start tmux session: {result.error_message or result.output}",
+                code=result.code, command_dispatched=result.command_dispatched,
             )
 
         # Verify session was created
@@ -1099,6 +1103,7 @@ echo "{marker}$__exit_code__"'''
                 request_id=write_result.request_id,
                 success=False,
                 error_message=f"Failed to write script file: {write_result.error_message}",
+                code=write_result.code, command_dispatched=False,
             )
 
         # Make script executable and start tmux session to run it
@@ -1117,18 +1122,21 @@ echo "{marker}$__exit_code__"'''
         )
 
         if not result.success:
-            # Clean up script file on failure
-            await self.bash(
-                sandbox_id=sandbox_id,
-                command=f"rm -f {shlex.quote(script_path)}",
-                container_name=container_name,
-                sync=True,
-                timeout=10,
-            )
+            # A lost reply may belong to a process that still needs this file.
+            # The accepted command owns cleanup; only a refusal proves it safe.
+            if result.command_dispatched is False:
+                await self.bash(
+                    sandbox_id=sandbox_id,
+                    command=f"rm -f {shlex.quote(script_path)}",
+                    container_name=container_name,
+                    sync=True,
+                    timeout=10,
+                )
             return TmuxStartResult(
                 request_id=result.request_id,
                 success=False,
                 error_message=f"Failed to start tmux session: {result.error_message or result.output}",
+                code=result.code, command_dispatched=result.command_dispatched,
             )
 
         # Verify session was created
