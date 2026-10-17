@@ -467,15 +467,15 @@ class EciSandbox:
         if not sandbox_id:
             return DeleteResult(success=False, error_message="sandbox_id is required")
 
-        request = eci_models.DeleteContainerGroupRequest(
-            region_id=self.region_id,
-            container_group_id=sandbox_id,
-            force=force,
-        )
-
         _log_api_call("DeleteContainerGroup", f"ContainerGroupId={sandbox_id}")
 
         try:
+            # DeleteContainerGroup has no Force parameter; ``force`` is kept
+            # only for call-site compatibility and is not sent to the API.
+            request = eci_models.DeleteContainerGroupRequest(
+                region_id=self.region_id,
+                container_group_id=sandbox_id,
+            )
             response = self.client.delete_container_group(request)
             request_id = extract_request_id(response)
             _log_api_response(
